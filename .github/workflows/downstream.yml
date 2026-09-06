@@ -18,30 +18,25 @@ env:
   UPSTREAM_BRANCH: "main"
   DOWNSTREAM_BRANCH: "downstream"
   RELEASE_BRANCH: "downstream-release"
+  DEV_CANDIDATE_BRANCH: "automation/downstream-candidate"
+  RELEASE_CANDIDATE_BRANCH: "automation/downstream-release-candidate"
 
 jobs:
-  sync-development:
-    name: Rebase downstream onto upstream/main
+  prepare-development:
+    name: Prepare development candidate
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 10
+    outputs:
+      candidate_sha: ${{ steps.prepare.outputs.candidate_sha }}
+      upstream_sha: ${{ steps.prepare.outputs.upstream_sha }}
+      expected_downstream: ${{ steps.prepare.outputs.expected_downstream }}
+      expected_main: ${{ steps.prepare.outputs.expected_main }}
 
     steps:
-      - name: Checkout downstream
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: downstream
           fetch-depth: 0
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 11.1.3
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "24"
-          cache: pnpm
 
       - name: Configure Git
         run: |
@@ -60,69 +55,155 @@ jobs:
           git fetch origin "$DOWNSTREAM_BRANCH" "$UPSTREAM_BRANCH"
 
       - name: Rebase patch stack
+        id: prepare
+        shell: bash
         run: |
+          set -Eeuo pipefail
+
           EXPECTED_DOWNSTREAM="$(git rev-parse "origin/$DOWNSTREAM_BRANCH")"
           EXPECTED_MAIN="$(git rev-parse "origin/$UPSTREAM_BRANCH")"
-
-          echo "EXPECTED_DOWNSTREAM=$EXPECTED_DOWNSTREAM" >> "$GITHUB_ENV"
-          echo "EXPECTED_MAIN=$EXPECTED_MAIN" >> "$GITHUB_ENV"
+          UPSTREAM_SHA="$(git rev-parse "upstream/$UPSTREAM_BRANCH")"
 
           git switch -C "$DOWNSTREAM_BRANCH" "origin/$DOWNSTREAM_BRANCH"
+          git rebase "$UPSTREAM_SHA"
 
-          # A conflict fails the job here. Since nothing has been pushed yet,
-          # the last known-good downstream branch remains untouched.
-          git rebase "upstream/$UPSTREAM_BRANCH"
+          CANDIDATE_SHA="$(git rev-parse HEAD)"
 
-      - name: Install
-        run: pnpm install --frozen-lockfile
+          {
+            echo "candidate_sha=$CANDIDATE_SHA"
+            echo "upstream_sha=$UPSTREAM_SHA"
+            echo "expected_downstream=$EXPECTED_DOWNSTREAM"
+            echo "expected_main=$EXPECTED_MAIN"
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Build
-        run: pnpm build
+          # Test a temporary ref; downstream itself stays at the last known-good
+          # SHA until all three validation shards succeed.
+          git push origin "HEAD:refs/heads/$DEV_CANDIDATE_BRANCH" --force
 
-      - name: Test
-        run: pnpm test
-
-      - name: Verify surface manifest
-        run: pnpm manifest --check
-
-      - name: Push mirror and rebased downstream
-        run: |
-          # Keep fork/main byte-for-byte aligned with upstream/main.
-          git push origin \
-            "upstream/$UPSTREAM_BRANCH:refs/heads/$UPSTREAM_BRANCH" \
-            --force-with-lease="refs/heads/$UPSTREAM_BRANCH:$EXPECTED_MAIN"
-
-          # Publish the rebased patch stack only after build/tests pass.
-          git push origin \
-            "$DOWNSTREAM_BRANCH:refs/heads/$DOWNSTREAM_BRANCH" \
-            --force-with-lease="refs/heads/$DOWNSTREAM_BRANCH:$EXPECTED_DOWNSTREAM"
-
-  release-patched:
-    name: Rebase patches onto latest release and publish
-    needs: sync-development
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+  test-development:
+    name: Test development (${{ matrix.shard }}/3)
+    needs: prepare-development
+    runs-on: macos-15
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    env:
+      SCRIPTC_TEST_WORKERS: "4"
 
     steps:
-      - name: Checkout fresh downstream
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
-          ref: downstream
-          fetch-depth: 0
+          ref: ${{ needs.prepare-development.outputs.candidate_sha }}
+          fetch-depth: 1
 
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           version: 11.1.3
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: "24"
+          node-version-file: .node-version
           cache: pnpm
-          registry-url: "https://npm.pkg.github.com"
 
-      - name: Configure Git and discover latest stable upstream release
+      - name: Install LLVM
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: brew install llvm@22
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Build native host packages
+        run: |
+          pnpm --filter @scriptc/llvm-darwin-arm64 build:native
+          pnpm --filter @scriptc/runtime-darwin-arm64 build:native
+
+      - run: pnpm build
+
+      # File-level sharding covers every file exactly once across the matrix.
+      # SCRIPTC_TEST_SHARD is intentionally unset, so whichever job owns a
+      # large case-driven harness runs all of that file's cases.
+      - name: Tests
+        run: pnpm test --shard=${{ matrix.shard }}/3
+
+      - name: Verify surface manifest
+        if: matrix.shard == 1
+        run: pnpm manifest --check
+
+  promote-development:
+    name: Promote tested development candidate
+    needs: [prepare-development, test-development]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      promoted_sha: ${{ needs.prepare-development.outputs.candidate_sha }}
+      upstream_sha: ${{ needs.prepare-development.outputs.upstream_sha }}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare-development.outputs.candidate_sha }}
+          fetch-depth: 0
+
+      - name: Promote tested SHA
+        env:
+          CANDIDATE_SHA: ${{ needs.prepare-development.outputs.candidate_sha }}
+          UPSTREAM_SHA: ${{ needs.prepare-development.outputs.upstream_sha }}
+          EXPECTED_DOWNSTREAM: ${{ needs.prepare-development.outputs.expected_downstream }}
+          EXPECTED_MAIN: ${{ needs.prepare-development.outputs.expected_main }}
+        run: |
+          set -Eeuo pipefail
+
+          git fetch origin "$DOWNSTREAM_BRANCH" "$UPSTREAM_BRANCH"
+
+          [ "$(git rev-parse "origin/$DOWNSTREAM_BRANCH")" = "$EXPECTED_DOWNSTREAM" ] || {
+            echo "downstream moved while tests were running; refusing to overwrite it"
+            exit 1
+          }
+
+          [ "$(git rev-parse "origin/$UPSTREAM_BRANCH")" = "$EXPECTED_MAIN" ] || {
+            echo "$UPSTREAM_BRANCH moved while tests were running; refusing to overwrite it"
+            exit 1
+          }
+
+          git push origin \
+            "$UPSTREAM_SHA:refs/heads/$UPSTREAM_BRANCH" \
+            --force-with-lease="refs/heads/$UPSTREAM_BRANCH:$EXPECTED_MAIN"
+
+          git push origin \
+            "$CANDIDATE_SHA:refs/heads/$DOWNSTREAM_BRANCH" \
+            --force-with-lease="refs/heads/$DOWNSTREAM_BRANCH:$EXPECTED_DOWNSTREAM"
+
+          git push origin ":refs/heads/$DEV_CANDIDATE_BRANCH" || true
+
+  prepare-release:
+    name: Prepare stable-release candidate
+    needs: promote-development
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      candidate_sha: ${{ steps.prepare.outputs.candidate_sha }}
+      latest_tag: ${{ steps.prepare.outputs.latest_tag }}
+      base_version: ${{ steps.prepare.outputs.base_version }}
+      custom_version: ${{ steps.prepare.outputs.custom_version }}
+      have_release_branch: ${{ steps.prepare.outputs.have_release_branch }}
+      expected_release: ${{ steps.prepare.outputs.expected_release }}
+      needs_release: ${{ steps.prepare.outputs.needs_release }}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.promote-development.outputs.promoted_sha }}
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .node-version
+          registry-url: "https://npm.pkg.github.com"
+          package-manager-cache: false
+
+      - name: Configure Git
         run: |
           git config user.name "scriptc-downstream[bot]"
           git config user.email "scriptc-downstream[bot]@users.noreply.github.com"
@@ -138,53 +219,47 @@ jobs:
           git fetch upstream "$UPSTREAM_BRANCH" --tags
           git fetch origin "$DOWNSTREAM_BRANCH"
 
-          if git ls-remote --exit-code --heads origin "$RELEASE_BRANCH" >/dev/null 2>&1; then
-            git fetch origin "$RELEASE_BRANCH"
-            echo "HAVE_RELEASE_BRANCH=1" >> "$GITHUB_ENV"
-            echo "EXPECTED_RELEASE=$(git rev-parse "origin/$RELEASE_BRANCH")" >> "$GITHUB_ENV"
-          else
-            echo "HAVE_RELEASE_BRANCH=0" >> "$GITHUB_ENV"
-          fi
-
-          LATEST_TAG="$(
-            git tag --merged "upstream/$UPSTREAM_BRANCH" --sort=-v:refname |
-              grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' |
-              head -n 1
-          )"
-
-          if [ -z "$LATEST_TAG" ]; then
-            echo "No stable vX.Y.Z tag reachable from upstream/$UPSTREAM_BRANCH"
-            exit 1
-          fi
-
-          echo "Latest stable upstream release: $LATEST_TAG"
-          echo "LATEST_TAG=$LATEST_TAG" >> "$GITHUB_ENV"
-
-      - name: Compose release patch branch
+      - name: Compose persistent release patch stack
+        id: prepare
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PROMOTED_SHA: ${{ needs.promote-development.outputs.promoted_sha }}
+          UPSTREAM_SHA: ${{ needs.promote-development.outputs.upstream_sha }}
         shell: bash
         run: |
           set -Eeuo pipefail
 
+          HAVE_RELEASE_BRANCH=0
+          EXPECTED_RELEASE=""
+
+          if git ls-remote --exit-code --heads origin "$RELEASE_BRANCH" >/dev/null 2>&1; then
+            HAVE_RELEASE_BRANCH=1
+            git fetch origin "$RELEASE_BRANCH"
+            EXPECTED_RELEASE="$(git rev-parse "origin/$RELEASE_BRANCH")"
+          fi
+
+          LATEST_TAG="$(
+            git tag --merged "$UPSTREAM_SHA" --sort=-v:refname |
+              grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' |
+              head -n 1
+          )"
+
+          [ -n "$LATEST_TAG" ] || {
+            echo "No stable vX.Y.Z tag is reachable from $UPSTREAM_SHA"
+            exit 1
+          }
+
           if [ "$HAVE_RELEASE_BRANCH" = "1" ]; then
             git switch -C release-candidate "origin/$RELEASE_BRANCH"
-
-            # Preserve release-only patches while moving the base to the new
-            # upstream tag. Git automatically drops patches now contained in
-            # the upstream release.
             git rebase "$LATEST_TAG"
           else
             git switch --detach "$LATEST_TAG"
             git switch -c release-candidate
           fi
 
-          # Keep this branch linear. The downstream model is intentionally a
-          # patch stack; merge commits make automatic replay ambiguous.
-          MERGES="$(
-            git rev-list --merges \
-              "upstream/$UPSTREAM_BRANCH..origin/$DOWNSTREAM_BRANCH"
-          )"
+          MERGES="$(git rev-list --merges "$UPSTREAM_SHA..$PROMOTED_SHA")"
           if [ -n "$MERGES" ]; then
-            echo "downstream contains merge commits. Rebase/linearize it first:"
+            echo "downstream contains merge commits; keep the patch stack linear:"
             git show -s --oneline $MERGES
             exit 1
           fi
@@ -195,17 +270,16 @@ jobs:
               awk 'NR == 1 { print $1 }'
           }
 
-          # Build a set of patches already carried by downstream-release.
           declare -A SEEN=()
+
           while IFS= read -r existing; do
             [ -n "$existing" ] || continue
             id="$(patch_id "$existing")"
             [ -n "$id" ] && SEEN["$id"]=1
           done < <(git rev-list "$LATEST_TAG..HEAD")
 
-          # Copy newly-created patches from development into the release patch
-          # stack. Once a patch is here, it stays here until an upstream RELEASE
-          # contains it, even if upstream/main merged it earlier.
+          # Keep release-only patches until an actual stable upstream tag
+          # contains them, even if upstream/main merged them earlier.
           while IFS= read -r patch; do
             [ -n "$patch" ] || continue
             id="$(patch_id "$patch")"
@@ -221,24 +295,17 @@ jobs:
             if git cherry-pick "$patch"; then
               SEEN["$id"]=1
             else
-              # An equivalent patch can occasionally become empty because of
-              # context changes that patch-id did not normalize identically.
               if git diff --quiet && git diff --cached --quiet; then
                 git cherry-pick --skip
                 SEEN["$id"]=1
               else
-                echo
-                echo "Patch conflict while composing $RELEASE_BRANCH."
-                echo "Resolve it manually on the branch and rerun this workflow."
+                echo "Patch conflict while composing $RELEASE_BRANCH"
                 exit 1
               fi
             fi
-          done < <(
-            git rev-list --reverse \
-              "upstream/$UPSTREAM_BRANCH..origin/$DOWNSTREAM_BRANCH"
-          )
+          done < <(git rev-list --reverse "$UPSTREAM_SHA..$PROMOTED_SHA")
 
-          RELEASE_SHA="$(git rev-parse HEAD)"
+          CANDIDATE_SHA="$(git rev-parse HEAD)"
           SHORT_SHA="$(git rev-parse --short=12 HEAD)"
 
           BASE_VERSION="$(
@@ -246,51 +313,170 @@ jobs:
               node -e '
                 let input = "";
                 process.stdin.on("data", d => input += d);
-                process.stdin.on("end", () => console.log(JSON.parse(input).version));
+                process.stdin.on("end", () =>
+                  console.log(JSON.parse(input).version)
+                );
               '
           )"
 
           CUSTOM_VERSION="${BASE_VERSION}-downstream.g${SHORT_SHA}"
+          OWNER="$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
+          COMPILER_PACKAGE="@$OWNER/scriptc-compiler"
+          CLI_PACKAGE="@$OWNER/scriptc"
 
-          echo "RELEASE_SHA=$RELEASE_SHA" >> "$GITHUB_ENV"
-          echo "BASE_VERSION=$BASE_VERSION" >> "$GITHUB_ENV"
-          echo "CUSTOM_VERSION=$CUSTOM_VERSION" >> "$GITHUB_ENV"
+          BRANCH_CHANGED=1
+          if [ "$HAVE_RELEASE_BRANCH" = "1" ] &&
+             [ "$CANDIDATE_SHA" = "$EXPECTED_RELEASE" ]; then
+            BRANCH_CHANGED=0
+          fi
 
-          echo "Release branch SHA: $RELEASE_SHA"
-          echo "Package version:    $CUSTOM_VERSION"
+          PACKAGES_EXIST=0
+          if npm view "$COMPILER_PACKAGE@$CUSTOM_VERSION" version \
+               --registry="https://npm.pkg.github.com" >/dev/null 2>&1 &&
+             npm view "$CLI_PACKAGE@$CUSTOM_VERSION" version \
+               --registry="https://npm.pkg.github.com" >/dev/null 2>&1; then
+            PACKAGES_EXIST=1
+          fi
 
-      - name: Verify matching official runtime packages exist
+          NEEDS_RELEASE=0
+          if [ "$BRANCH_CHANGED" = "1" ] || [ "$PACKAGES_EXIST" = "0" ]; then
+            NEEDS_RELEASE=1
+            git push origin "HEAD:refs/heads/$RELEASE_CANDIDATE_BRANCH" --force
+          fi
+
+          {
+            echo "candidate_sha=$CANDIDATE_SHA"
+            echo "latest_tag=$LATEST_TAG"
+            echo "base_version=$BASE_VERSION"
+            echo "custom_version=$CUSTOM_VERSION"
+            echo "have_release_branch=$HAVE_RELEASE_BRANCH"
+            echo "expected_release=$EXPECTED_RELEASE"
+            echo "needs_release=$NEEDS_RELEASE"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Latest upstream release: $LATEST_TAG"
+          echo "Custom package version: $CUSTOM_VERSION"
+          echo "Branch changed: $BRANCH_CHANGED"
+          echo "Packages already exist: $PACKAGES_EXIST"
+
+  test-release:
+    name: Test release (${{ matrix.shard }}/3)
+    needs: prepare-release
+    if: needs.prepare-release.outputs.needs_release == '1'
+    runs-on: macos-15
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    env:
+      SCRIPTC_TEST_WORKERS: "4"
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare-release.outputs.candidate_sha }}
+          fetch-depth: 1
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 11.1.3
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+
+      - name: Install LLVM
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: brew install llvm@22
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Build native host packages
+        run: |
+          pnpm --filter @scriptc/llvm-darwin-arm64 build:native
+          pnpm --filter @scriptc/runtime-darwin-arm64 build:native
+
+      - run: pnpm build
+      - run: pnpm test --shard=${{ matrix.shard }}/3
+
+      - name: Verify surface manifest
+        if: matrix.shard == 1
+        run: pnpm manifest --check
+
+  publish-release:
+    name: Promote release and publish packages
+    needs: [prepare-release, test-release]
+    if: >-
+      ${{
+        always() &&
+        needs.prepare-release.result == 'success' &&
+        needs.prepare-release.outputs.needs_release == '1' &&
+        needs.test-release.result == 'success'
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare-release.outputs.candidate_sha }}
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 11.1.3
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+          registry-url: "https://npm.pkg.github.com"
+
+      - name: Verify official matching packages
+        env:
+          BASE_VERSION: ${{ needs.prepare-release.outputs.base_version }}
         run: |
           npm view "@scriptc/compiler@$BASE_VERSION" version \
             --registry="https://registry.npmjs.org" >/dev/null
           npm view "@scriptc/runtime@$BASE_VERSION" version \
             --registry="https://registry.npmjs.org" >/dev/null
 
-      - name: Install
-        run: pnpm install --frozen-lockfile
+      - run: pnpm install --frozen-lockfile
 
-      - name: Build
-        run: pnpm build
-
-      - name: Test
-        run: pnpm test
-
-      - name: Verify surface manifest
-        run: pnpm manifest --check
-
-      - name: Push downstream-release
+      - name: Build package artifacts
         run: |
+          pnpm build
+          pnpm manifest --check
+
+      - name: Promote downstream-release
+        env:
+          CANDIDATE_SHA: ${{ needs.prepare-release.outputs.candidate_sha }}
+          HAVE_RELEASE_BRANCH: ${{ needs.prepare-release.outputs.have_release_branch }}
+          EXPECTED_RELEASE: ${{ needs.prepare-release.outputs.expected_release }}
+        run: |
+          set -Eeuo pipefail
+
           if [ "$HAVE_RELEASE_BRANCH" = "1" ]; then
+            git fetch origin "$RELEASE_BRANCH"
+            [ "$(git rev-parse "origin/$RELEASE_BRANCH")" = "$EXPECTED_RELEASE" ] || {
+              echo "$RELEASE_BRANCH moved while tests were running; refusing to overwrite it"
+              exit 1
+            }
+
             git push origin \
-              "HEAD:refs/heads/$RELEASE_BRANCH" \
+              "$CANDIDATE_SHA:refs/heads/$RELEASE_BRANCH" \
               --force-with-lease="refs/heads/$RELEASE_BRANCH:$EXPECTED_RELEASE"
           else
-            # First creation must fail rather than overwrite if another actor
-            # raced us and created the branch.
-            git push origin "HEAD:refs/heads/$RELEASE_BRANCH"
+            git push origin "$CANDIDATE_SHA:refs/heads/$RELEASE_BRANCH"
           fi
 
       - name: Stage custom GitHub Packages
+        env:
+          BASE_VERSION: ${{ needs.prepare-release.outputs.base_version }}
+          CUSTOM_VERSION: ${{ needs.prepare-release.outputs.custom_version }}
         run: |
           STAGE_ROOT="$RUNNER_TEMP/scriptc-packages"
           COMPILER_STAGE="$STAGE_ROOT/compiler"
@@ -318,13 +504,11 @@ jobs:
           const baseVersion = process.env.BASE_VERSION;
           const registry = "https://npm.pkg.github.com";
 
-          const compilerDir = path.join(root, "compiler");
-          const cliDir = path.join(root, "cli");
-
           const read = p => JSON.parse(fs.readFileSync(p, "utf8"));
           const write = (p, value) =>
             fs.writeFileSync(p, JSON.stringify(value, null, 2) + "\n");
 
+          const compilerDir = path.join(root, "compiler");
           const compilerPath = path.join(compilerDir, "package.json");
           const compiler = read(compilerPath);
           const compilerName = `@${owner}/scriptc-compiler`;
@@ -336,10 +520,7 @@ jobs:
             url: `git+https://github.com/${repo}.git`,
             directory: "packages/compiler"
           };
-          compiler.publishConfig = {
-            ...(compiler.publishConfig || {}),
-            registry
-          };
+          compiler.publishConfig = { ...(compiler.publishConfig || {}), registry };
 
           for (const group of ["dependencies", "optionalDependencies"]) {
             if (!compiler[group]) continue;
@@ -357,6 +538,7 @@ jobs:
           manifest.compilerVersion = version;
           write(manifestPath, manifest);
 
+          const cliDir = path.join(root, "cli");
           const cliPath = path.join(cliDir, "package.json");
           const cli = read(cliPath);
 
@@ -367,19 +549,12 @@ jobs:
             url: `git+https://github.com/${repo}.git`,
             directory: "packages/cli"
           };
-          cli.publishConfig = {
-            ...(cli.publishConfig || {}),
-            registry
-          };
-
+          cli.publishConfig = { ...(cli.publishConfig || {}), registry };
           cli.dependencies = cli.dependencies || {};
           cli.dependencies["@scriptc/compiler"] =
             `npm:${compilerName}@${version}`;
 
           write(cliPath, cli);
-
-          console.log(`Staged ${compilerName}@${version}`);
-          console.log(`Staged @${owner}/scriptc@${version}`);
           NODE
 
           echo "STAGE_ROOT=$STAGE_ROOT" >> "$GITHUB_ENV"
@@ -387,14 +562,17 @@ jobs:
       - name: Publish custom compiler and CLI
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CUSTOM_VERSION: ${{ needs.prepare-release.outputs.custom_version }}
         run: |
+          set -Eeuo pipefail
+
           publish_if_missing() {
             dir="$1"
             name="$(node -p "require('./$dir/package.json').name")"
 
-            if npm view "$name@$CUSTOM_VERSION" \
+            if npm view "$name@$CUSTOM_VERSION" version \
               --registry="https://npm.pkg.github.com" >/dev/null 2>&1; then
-              echo "$name@$CUSTOM_VERSION already exists; skipping"
+              echo "$name@$CUSTOM_VERSION already published; skipping"
               return 0
             fi
 
@@ -403,21 +581,34 @@ jobs:
               --tag downstream
           }
 
-          # Dependency order matters: the custom CLI aliases this exact custom
-          # compiler version.
           publish_if_missing "$STAGE_ROOT/compiler"
           publish_if_missing "$STAGE_ROOT/cli"
 
+      - name: Clean candidate
+        if: always()
+        run: git push origin ":refs/heads/$RELEASE_CANDIDATE_BRANCH" || true
+
       - name: Summary
+        env:
+          LATEST_TAG: ${{ needs.prepare-release.outputs.latest_tag }}
+          CUSTOM_VERSION: ${{ needs.prepare-release.outputs.custom_version }}
         run: |
           OWNER="$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
           {
             echo "## ScriptC downstream published"
             echo
             echo "- Upstream release: \`$LATEST_TAG\`"
-            echo "- Release branch: \`$RELEASE_BRANCH\`"
             echo "- Version: \`$CUSTOM_VERSION\`"
             echo "- Compiler: \`@$OWNER/scriptc-compiler@$CUSTOM_VERSION\`"
             echo "- CLI: \`@$OWNER/scriptc@$CUSTOM_VERSION\`"
             echo "- Dist-tag: \`downstream\`"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  no-release-needed:
+    name: Release already current
+    needs: prepare-release
+    if: needs.prepare-release.outputs.needs_release == '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - run: echo "Release branch and both packages are already current."
