@@ -1,0 +1,423 @@
+name: Downstream ScriptC
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 */6 * * *"
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: downstream-scriptc
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: "vercel-labs/scriptc"
+  UPSTREAM_BRANCH: "main"
+  DOWNSTREAM_BRANCH: "downstream"
+  RELEASE_BRANCH: "downstream-release"
+
+jobs:
+  sync-development:
+    name: Rebase downstream onto upstream/main
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout downstream
+        uses: actions/checkout@v4
+        with:
+          ref: downstream
+          fetch-depth: 0
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: pnpm
+
+      - name: Configure Git
+        run: |
+          git config user.name "scriptc-downstream[bot]"
+          git config user.email "scriptc-downstream[bot]@users.noreply.github.com"
+          git config rerere.enabled true
+          git config rerere.autoupdate true
+
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote set-url upstream "https://github.com/$UPSTREAM_REPO.git"
+          else
+            git remote add upstream "https://github.com/$UPSTREAM_REPO.git"
+          fi
+
+          git fetch upstream "$UPSTREAM_BRANCH" --tags
+          git fetch origin "$DOWNSTREAM_BRANCH" "$UPSTREAM_BRANCH"
+
+      - name: Rebase patch stack
+        run: |
+          EXPECTED_DOWNSTREAM="$(git rev-parse "origin/$DOWNSTREAM_BRANCH")"
+          EXPECTED_MAIN="$(git rev-parse "origin/$UPSTREAM_BRANCH")"
+
+          echo "EXPECTED_DOWNSTREAM=$EXPECTED_DOWNSTREAM" >> "$GITHUB_ENV"
+          echo "EXPECTED_MAIN=$EXPECTED_MAIN" >> "$GITHUB_ENV"
+
+          git switch -C "$DOWNSTREAM_BRANCH" "origin/$DOWNSTREAM_BRANCH"
+
+          # A conflict fails the job here. Since nothing has been pushed yet,
+          # the last known-good downstream branch remains untouched.
+          git rebase "upstream/$UPSTREAM_BRANCH"
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+      - name: Test
+        run: pnpm test
+
+      - name: Verify surface manifest
+        run: pnpm manifest --check
+
+      - name: Push mirror and rebased downstream
+        run: |
+          # Keep fork/main byte-for-byte aligned with upstream/main.
+          git push origin \
+            "upstream/$UPSTREAM_BRANCH:refs/heads/$UPSTREAM_BRANCH" \
+            --force-with-lease="refs/heads/$UPSTREAM_BRANCH:$EXPECTED_MAIN"
+
+          # Publish the rebased patch stack only after build/tests pass.
+          git push origin \
+            "$DOWNSTREAM_BRANCH:refs/heads/$DOWNSTREAM_BRANCH" \
+            --force-with-lease="refs/heads/$DOWNSTREAM_BRANCH:$EXPECTED_DOWNSTREAM"
+
+  release-patched:
+    name: Rebase patches onto latest release and publish
+    needs: sync-development
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout fresh downstream
+        uses: actions/checkout@v4
+        with:
+          ref: downstream
+          fetch-depth: 0
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: pnpm
+          registry-url: "https://npm.pkg.github.com"
+
+      - name: Configure Git and discover latest stable upstream release
+        run: |
+          git config user.name "scriptc-downstream[bot]"
+          git config user.email "scriptc-downstream[bot]@users.noreply.github.com"
+          git config rerere.enabled true
+          git config rerere.autoupdate true
+
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote set-url upstream "https://github.com/$UPSTREAM_REPO.git"
+          else
+            git remote add upstream "https://github.com/$UPSTREAM_REPO.git"
+          fi
+
+          git fetch upstream "$UPSTREAM_BRANCH" --tags
+          git fetch origin "$DOWNSTREAM_BRANCH"
+
+          if git ls-remote --exit-code --heads origin "$RELEASE_BRANCH" >/dev/null 2>&1; then
+            git fetch origin "$RELEASE_BRANCH"
+            echo "HAVE_RELEASE_BRANCH=1" >> "$GITHUB_ENV"
+            echo "EXPECTED_RELEASE=$(git rev-parse "origin/$RELEASE_BRANCH")" >> "$GITHUB_ENV"
+          else
+            echo "HAVE_RELEASE_BRANCH=0" >> "$GITHUB_ENV"
+          fi
+
+          LATEST_TAG="$(
+            git tag --merged "upstream/$UPSTREAM_BRANCH" --sort=-v:refname |
+              grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' |
+              head -n 1
+          )"
+
+          if [ -z "$LATEST_TAG" ]; then
+            echo "No stable vX.Y.Z tag reachable from upstream/$UPSTREAM_BRANCH"
+            exit 1
+          fi
+
+          echo "Latest stable upstream release: $LATEST_TAG"
+          echo "LATEST_TAG=$LATEST_TAG" >> "$GITHUB_ENV"
+
+      - name: Compose release patch branch
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          if [ "$HAVE_RELEASE_BRANCH" = "1" ]; then
+            git switch -C release-candidate "origin/$RELEASE_BRANCH"
+
+            # Preserve release-only patches while moving the base to the new
+            # upstream tag. Git automatically drops patches now contained in
+            # the upstream release.
+            git rebase "$LATEST_TAG"
+          else
+            git switch --detach "$LATEST_TAG"
+            git switch -c release-candidate
+          fi
+
+          # Keep this branch linear. The downstream model is intentionally a
+          # patch stack; merge commits make automatic replay ambiguous.
+          MERGES="$(
+            git rev-list --merges \
+              "upstream/$UPSTREAM_BRANCH..origin/$DOWNSTREAM_BRANCH"
+          )"
+          if [ -n "$MERGES" ]; then
+            echo "downstream contains merge commits. Rebase/linearize it first:"
+            git show -s --oneline $MERGES
+            exit 1
+          fi
+
+          patch_id() {
+            git show --pretty=format: --patch "$1" |
+              git patch-id --stable |
+              awk 'NR == 1 { print $1 }'
+          }
+
+          # Build a set of patches already carried by downstream-release.
+          declare -A SEEN=()
+          while IFS= read -r existing; do
+            [ -n "$existing" ] || continue
+            id="$(patch_id "$existing")"
+            [ -n "$id" ] && SEEN["$id"]=1
+          done < <(git rev-list "$LATEST_TAG..HEAD")
+
+          # Copy newly-created patches from development into the release patch
+          # stack. Once a patch is here, it stays here until an upstream RELEASE
+          # contains it, even if upstream/main merged it earlier.
+          while IFS= read -r patch; do
+            [ -n "$patch" ] || continue
+            id="$(patch_id "$patch")"
+            [ -n "$id" ] || continue
+
+            if [ "${SEEN[$id]+yes}" = "yes" ]; then
+              echo "Already carried: $(git show -s --format='%h %s' "$patch")"
+              continue
+            fi
+
+            echo "Adding patch: $(git show -s --format='%h %s' "$patch")"
+
+            if git cherry-pick "$patch"; then
+              SEEN["$id"]=1
+            else
+              # An equivalent patch can occasionally become empty because of
+              # context changes that patch-id did not normalize identically.
+              if git diff --quiet && git diff --cached --quiet; then
+                git cherry-pick --skip
+                SEEN["$id"]=1
+              else
+                echo
+                echo "Patch conflict while composing $RELEASE_BRANCH."
+                echo "Resolve it manually on the branch and rerun this workflow."
+                exit 1
+              fi
+            fi
+          done < <(
+            git rev-list --reverse \
+              "upstream/$UPSTREAM_BRANCH..origin/$DOWNSTREAM_BRANCH"
+          )
+
+          RELEASE_SHA="$(git rev-parse HEAD)"
+          SHORT_SHA="$(git rev-parse --short=12 HEAD)"
+
+          BASE_VERSION="$(
+            git show "$LATEST_TAG:packages/compiler/package.json" |
+              node -e '
+                let input = "";
+                process.stdin.on("data", d => input += d);
+                process.stdin.on("end", () => console.log(JSON.parse(input).version));
+              '
+          )"
+
+          CUSTOM_VERSION="${BASE_VERSION}-downstream.g${SHORT_SHA}"
+
+          echo "RELEASE_SHA=$RELEASE_SHA" >> "$GITHUB_ENV"
+          echo "BASE_VERSION=$BASE_VERSION" >> "$GITHUB_ENV"
+          echo "CUSTOM_VERSION=$CUSTOM_VERSION" >> "$GITHUB_ENV"
+
+          echo "Release branch SHA: $RELEASE_SHA"
+          echo "Package version:    $CUSTOM_VERSION"
+
+      - name: Verify matching official runtime packages exist
+        run: |
+          npm view "@scriptc/compiler@$BASE_VERSION" version \
+            --registry="https://registry.npmjs.org" >/dev/null
+          npm view "@scriptc/runtime@$BASE_VERSION" version \
+            --registry="https://registry.npmjs.org" >/dev/null
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+      - name: Test
+        run: pnpm test
+
+      - name: Verify surface manifest
+        run: pnpm manifest --check
+
+      - name: Push downstream-release
+        run: |
+          if [ "$HAVE_RELEASE_BRANCH" = "1" ]; then
+            git push origin \
+              "HEAD:refs/heads/$RELEASE_BRANCH" \
+              --force-with-lease="refs/heads/$RELEASE_BRANCH:$EXPECTED_RELEASE"
+          else
+            # First creation must fail rather than overwrite if another actor
+            # raced us and created the branch.
+            git push origin "HEAD:refs/heads/$RELEASE_BRANCH"
+          fi
+
+      - name: Stage custom GitHub Packages
+        run: |
+          STAGE_ROOT="$RUNNER_TEMP/scriptc-packages"
+          COMPILER_STAGE="$STAGE_ROOT/compiler"
+          CLI_STAGE="$STAGE_ROOT/cli"
+
+          mkdir -p "$COMPILER_STAGE" "$CLI_STAGE"
+
+          cp packages/compiler/package.json "$COMPILER_STAGE/"
+          cp -R packages/compiler/dist "$COMPILER_STAGE/"
+          cp -R packages/compiler/ambient "$COMPILER_STAGE/"
+          cp packages/compiler/surface-manifest.json "$COMPILER_STAGE/"
+
+          cp packages/cli/package.json "$CLI_STAGE/"
+          cp -R packages/cli/dist "$CLI_STAGE/"
+          cp -R packages/cli/scripts "$CLI_STAGE/"
+
+          STAGE_ROOT="$STAGE_ROOT" node <<'NODE'
+          const fs = require("node:fs");
+          const path = require("node:path");
+
+          const root = process.env.STAGE_ROOT;
+          const owner = process.env.GITHUB_REPOSITORY_OWNER.toLowerCase();
+          const repo = process.env.GITHUB_REPOSITORY;
+          const version = process.env.CUSTOM_VERSION;
+          const baseVersion = process.env.BASE_VERSION;
+          const registry = "https://npm.pkg.github.com";
+
+          const compilerDir = path.join(root, "compiler");
+          const cliDir = path.join(root, "cli");
+
+          const read = p => JSON.parse(fs.readFileSync(p, "utf8"));
+          const write = (p, value) =>
+            fs.writeFileSync(p, JSON.stringify(value, null, 2) + "\n");
+
+          const compilerPath = path.join(compilerDir, "package.json");
+          const compiler = read(compilerPath);
+          const compilerName = `@${owner}/scriptc-compiler`;
+
+          compiler.name = compilerName;
+          compiler.version = version;
+          compiler.repository = {
+            type: "git",
+            url: `git+https://github.com/${repo}.git`,
+            directory: "packages/compiler"
+          };
+          compiler.publishConfig = {
+            ...(compiler.publishConfig || {}),
+            registry
+          };
+
+          for (const group of ["dependencies", "optionalDependencies"]) {
+            if (!compiler[group]) continue;
+            for (const [name, spec] of Object.entries(compiler[group])) {
+              if (typeof spec === "string" && spec.startsWith("workspace:")) {
+                compiler[group][name] = baseVersion;
+              }
+            }
+          }
+
+          write(compilerPath, compiler);
+
+          const manifestPath = path.join(compilerDir, "surface-manifest.json");
+          const manifest = read(manifestPath);
+          manifest.compilerVersion = version;
+          write(manifestPath, manifest);
+
+          const cliPath = path.join(cliDir, "package.json");
+          const cli = read(cliPath);
+
+          cli.name = `@${owner}/scriptc`;
+          cli.version = version;
+          cli.repository = {
+            type: "git",
+            url: `git+https://github.com/${repo}.git`,
+            directory: "packages/cli"
+          };
+          cli.publishConfig = {
+            ...(cli.publishConfig || {}),
+            registry
+          };
+
+          cli.dependencies = cli.dependencies || {};
+          cli.dependencies["@scriptc/compiler"] =
+            `npm:${compilerName}@${version}`;
+
+          write(cliPath, cli);
+
+          console.log(`Staged ${compilerName}@${version}`);
+          console.log(`Staged @${owner}/scriptc@${version}`);
+          NODE
+
+          echo "STAGE_ROOT=$STAGE_ROOT" >> "$GITHUB_ENV"
+
+      - name: Publish custom compiler and CLI
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          publish_if_missing() {
+            dir="$1"
+            name="$(node -p "require('./$dir/package.json').name")"
+
+            if npm view "$name@$CUSTOM_VERSION" \
+              --registry="https://npm.pkg.github.com" >/dev/null 2>&1; then
+              echo "$name@$CUSTOM_VERSION already exists; skipping"
+              return 0
+            fi
+
+            npm publish "$dir" \
+              --registry="https://npm.pkg.github.com" \
+              --tag downstream
+          }
+
+          # Dependency order matters: the custom CLI aliases this exact custom
+          # compiler version.
+          publish_if_missing "$STAGE_ROOT/compiler"
+          publish_if_missing "$STAGE_ROOT/cli"
+
+      - name: Summary
+        run: |
+          OWNER="$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
+          {
+            echo "## ScriptC downstream published"
+            echo
+            echo "- Upstream release: \`$LATEST_TAG\`"
+            echo "- Release branch: \`$RELEASE_BRANCH\`"
+            echo "- Version: \`$CUSTOM_VERSION\`"
+            echo "- Compiler: \`@$OWNER/scriptc-compiler@$CUSTOM_VERSION\`"
+            echo "- CLI: \`@$OWNER/scriptc@$CUSTOM_VERSION\`"
+            echo "- Dist-tag: \`downstream\`"
+          } >> "$GITHUB_STEP_SUMMARY"
