@@ -565,7 +565,7 @@ jobs:
 
           const manifestPath = path.join(compilerDir, "surface-manifest.json");
           const manifest = read(manifestPath);
-          manifest.compilerVersion = version;
+          manifest.compilerVersion = baseVersion;
           write(manifestPath, manifest);
 
           const cliDir = path.join(root, "cli");
