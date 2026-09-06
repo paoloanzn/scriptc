@@ -133,6 +133,36 @@ jobs:
 
           write(compilerPath, compiler);
 
+          // The compiler resolves its shipped declaration files through its
+          // own package name. This downstream package is renamed from
+          // @scriptc/compiler to @<owner>/scriptc-compiler, so rewrite those
+          // built self-references before publishing.
+          const rewriteCompilerSelfRefs = dir => {
+            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+              const file = path.join(dir, entry.name);
+
+              if (entry.isDirectory()) {
+                rewriteCompilerSelfRefs(file);
+                continue;
+              }
+
+              if (!entry.isFile()) continue;
+
+              const source = fs.readFileSync(file, "utf8");
+              const rewritten = source.replaceAll(
+                "@scriptc/compiler/",
+                `${compilerName}/`
+              );
+
+              if (rewritten !== source) {
+                fs.writeFileSync(file, rewritten);
+                console.log(`Rewrote compiler self-reference in ${file}`);
+              }
+            }
+          };
+
+          rewriteCompilerSelfRefs(path.join(compilerDir, "dist"));
+
           const manifestPath = path.join(compilerDir, "surface-manifest.json");
           const manifest = read(manifestPath);
           manifest.compilerVersion = version;
